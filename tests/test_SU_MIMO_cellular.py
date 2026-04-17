@@ -29,7 +29,7 @@ except ImportError as e:
     raise e
 
 from sionna.phy.channel.tr38901 import PanelArray
-from sionna.phy.ofdm import ResourceGrid, RZFPrecodedChannel, LMMSEPostEqualizationSINR
+from sionna.phy.ofdm import ResourceGrid, RZFPrecodedChannel
 from sionna.phy.utils import dbm_to_watt
 
 from functions.utils import *
@@ -130,10 +130,6 @@ def compute_drop_log_capacity_samples(sls: SystemLevelSimulator,
     s = tx_power.shape
     tx_power = torch.reshape(tx_power, [s[0], s[1]*s[2]] + list(s[3:]))
     
-    lmmse_posteq_sinr = LMMSEPostEqualizationSINR(
-        resource_grid=rg,
-        stream_management=sls.stream_management)
-
     # Deterministic arbitrary choice: select a fixed global sector index.
     target_bs = int(target_sector_index)
     if target_bs < 0 or target_bs >= sls.num_bs:
@@ -145,21 +141,34 @@ def compute_drop_log_capacity_samples(sls: SystemLevelSimulator,
         h_freq_fading = sls.channel_matrix.apply_fading(h_freq)
 
         h_eff = zf_precoder(h_freq_fading, tx_power=tx_power, alpha=zf_alpha)
-        sinr = lmmse_posteq_sinr(h_eff, no=sls.no, interference_whitening=True)
+        if h_eff.ndim != 7:
+            raise RuntimeError(f'Unexpected effective channel shape: {tuple(h_eff.shape)}')
+        # h_eff dimensions:
+        # [batch, num_rx, num_rx_ant, num_tx, num_streams_per_tx, num_ofdm_sym, num_subcarriers]
+        if h_eff.shape[1] != sls.num_ut or h_eff.shape[3] != sls.num_bs:
+            raise RuntimeError(f'Unexpected effective channel shape: {tuple(h_eff.shape)}')
 
-        sinr = torch.reshape(
-            sinr,
-            [sls.batch_size,
-             rg.num_ofdm_symbols,
-             rg.fft_size,
-             sls.num_bs,
-             sls.num_ut_per_sector,
-             num_streams_per_ut])
-        sinr = torch.permute(sinr, [0, 3, 1, 2, 4, 5])
-        sinr_target = sinr[:, target_bs, :, :, 0, :]
+        # Select the first UE in the chosen sector (global RX index).
+        target_rx = target_bs * sls.num_ut_per_sector
+        target_tx = target_bs
 
-        # Capacity-like metric in nats/s/Hz per stream per RE.
-        log_capacity = torch.log1p(torch.clamp(sinr_target, min=0.0))
+        # Compute per-stream SINR directly from effective channel G (no post-equalization vector u):
+        #   SINR_m = |G_{target_rx, :, target_tx, m}|^2
+        #            / (sum_{(b,j)!=(target_tx,m)} |G_{target_rx, :, b, j}|^2 + no)
+        # 1) Power per receive antenna is accumulated to form scalar stream powers.
+        stream_power = torch.sum(torch.abs(h_eff) ** 2, dim=2)
+        # [batch, num_tx, num_streams_per_tx, num_ofdm_sym, num_subcarriers]
+        rx_power = stream_power[:, target_rx, :, :, :, :]
+        # [batch, num_streams_per_tx, num_ofdm_sym, num_subcarriers]
+        signal = rx_power[:, target_tx, :, :, :]
+        # [batch, num_ofdm_sym, num_subcarriers]
+        total_power = torch.sum(rx_power, dim=(1, 2))
+        # [batch, num_streams_per_tx, num_ofdm_sym, num_subcarriers]
+        interference = torch.clamp(total_power.unsqueeze(1) - signal, min=0.0)
+        sinr_target = signal / (interference + sls.no)
+
+        # Capacity-like metric in bits/s/Hz per stream per RE.
+        log_capacity = torch.log2(1.0 + torch.clamp(sinr_target, min=0.0))
         slot_samples.append(log_capacity.detach().cpu().numpy().ravel())
 
         # Match slot-wise behavior used in e2e_example.py.
@@ -227,7 +236,7 @@ def main():
 
     plt.figure(figsize=(6, 4))
     plt.plot(x, y, linewidth=2)
-    plt.xlabel('log(1 + SINR)')
+    plt.xlabel('log2(1 + SINR) [bits/s/Hz]')
     plt.ylabel('CDF')
     plt.title(f'SU-MIMO ZF: CDF over {args.num_drops} drops × {args.num_slots} slots')
     plt.grid(True, alpha=0.3)
