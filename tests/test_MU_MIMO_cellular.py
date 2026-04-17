@@ -179,12 +179,16 @@ def compute_drop_log_capacity_samples(sls: SystemLevelSimulator,
         sinr = torch.permute(sinr, [0, 3, 1, 2, 4, 5])
         target_sinr = sinr[:, target_bs, :, :, :, :]
 
-        # Per-UE rate metric: sum_s log2(1 + SINR_s), per RE.
+        # Sector sum-throughput metric:
+        # sum over streams and users, per RE.
         stream_sum_rate = torch.sum(
             torch.log2(1.0 + torch.clamp(target_sinr, min=0.0)), dim=-1)
+        stream_sum_rate = torch.sum(stream_sum_rate, dim=-1)
         slot_stream_sum_samples.append(stream_sum_rate.detach().cpu().numpy().ravel())
 
-        # Combiner-agnostic alternative for each UE in the target sector.
+        # Combiner-agnostic alternative:
+        # per-UE log-det (desired streams = that UE streams), then sum across UEs.
+        logdet_rate_per_ut = []
         for ut_idx in range(num_ut_per_sector):
             target_rx = target_bs * num_ut_per_sector + ut_idx
             start = ut_idx * num_streams_per_ut
@@ -192,12 +196,14 @@ def compute_drop_log_capacity_samples(sls: SystemLevelSimulator,
             desired_stream_indices = torch.arange(
                 start, end, dtype=torch.long, device=sls.device)
             h_eff_target_rx = h_eff[:, target_rx, :, :, :, :, :]
-            logdet_rate = _compute_logdet_capacity_from_precoded_channel(
+            logdet_rate_ut = _compute_logdet_capacity_from_precoded_channel(
                 h_eff_target_rx=h_eff_target_rx,
                 no=sls.no,
                 target_tx=target_bs,
                 desired_stream_indices=desired_stream_indices)
-            slot_logdet_samples.append(logdet_rate.detach().cpu().numpy().ravel())
+            logdet_rate_per_ut.append(logdet_rate_ut)
+        logdet_rate_sector = torch.sum(torch.stack(logdet_rate_per_ut, dim=0), dim=0)
+        slot_logdet_samples.append(logdet_rate_sector.detach().cpu().numpy().ravel())
 
         # Match slot-wise behavior used in e2e_example.py.
         sls.ut_loc = sls.ut_loc + sls.ut_velocities * sls.slot_duration
@@ -210,7 +216,7 @@ def compute_drop_log_capacity_samples(sls: SystemLevelSimulator,
 
 
 def main():
-    parser = argparse.ArgumentParser(description='MU-MIMO cellular ZF SINR CDF experiment')
+    parser = argparse.ArgumentParser(description='MU-MIMO sector sum-throughput CDF experiment')
     parser.add_argument('--num-drops', type=int, default=10)
     parser.add_argument('--num-slots', type=int, default=10,
                         help='Number of slots simulated per drop (default: 10)')
@@ -269,12 +275,13 @@ def main():
     x_logdet, y_logdet = get_cdf(all_logdet_samples)
 
     plt.figure(figsize=(6, 4))
-    plt.plot(x_stream, y_stream, linewidth=2, label='Sum over streams: log2(1+SINR_s)')
-    plt.plot(x_logdet, y_logdet, linewidth=2, linestyle='--', label='log2 det(I + R^-1 S)')
-    plt.xlabel('Rate [bits/s/Hz]')
+    plt.plot(x_stream, y_stream, linewidth=2, label='Sector sum throughput: Σ_{u,s} log2(1+SINR_{u,s})')
+    plt.plot(x_logdet, y_logdet, linewidth=2, linestyle='--',
+             label='Sector sum throughput: Σ_u log2 det(I + R_u^-1 S_u)')
+    plt.xlabel('Sector throughput [bits/s/Hz per RE]')
     plt.ylabel('CDF')
     plt.legend()
-    plt.title(f'MU-MIMO ZF: CDF over {args.num_drops} drops × {args.num_slots} slots')
+    plt.title(f'MU-MIMO ZF sector sum throughput: CDF over {args.num_drops} drops × {args.num_slots} slots')
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
     plt.savefig(args.out, dpi=300)

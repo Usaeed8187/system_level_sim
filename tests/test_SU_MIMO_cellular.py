@@ -216,7 +216,7 @@ def compute_drop_log_capacity_samples(sls: SystemLevelSimulator,
     return np.concatenate(slot_stream_sum_samples), np.concatenate(slot_logdet_samples)
 
 def main():
-    parser = argparse.ArgumentParser(description='SU-MIMO cellular ZF SINR CDF experiment')
+    parser = argparse.ArgumentParser(description='SU-MIMO sector sum-throughput CDF experiment')
     parser.add_argument('--num-drops', type=int, default=10)
     parser.add_argument('--num-slots', type=int, default=10,
                         help='Number of slots simulated per drop (default: 10)')
@@ -274,11 +274,12 @@ def main():
     x_logdet, y_logdet = get_cdf(all_logdet_samples)
 
     plt.figure(figsize=(6, 4))
-    plt.plot(x_stream, y_stream, linewidth=2, label='Sum over streams: log2(1+SINR_s)')
-    plt.plot(x_logdet, y_logdet, linewidth=2, linestyle='--', label='log2 det(I + R^-1 S)')
-    plt.xlabel('Rate [bits/s/Hz]')
+    plt.plot(x_stream, y_stream, linewidth=2, label='Sector sum throughput: Σ_s log2(1+SINR_s)')
+    plt.plot(x_logdet, y_logdet, linewidth=2, linestyle='--',
+             label='Sector sum throughput: log2 det(I + R^-1 S)')
+    plt.xlabel('Sector throughput [bits/s/Hz per RE]')
     plt.ylabel('CDF')
-    plt.title(f'SU-MIMO ZF: CDF over {args.num_drops} drops × {args.num_slots} slots')
+    plt.title(f'SU-MIMO ZF sector sum throughput: CDF over {args.num_drops} drops × {args.num_slots} slots')
     plt.legend()
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
