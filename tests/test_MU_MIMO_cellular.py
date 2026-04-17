@@ -29,7 +29,7 @@ except ImportError as e:
     raise e
 
 from sionna.phy.channel.tr38901 import PanelArray
-from sionna.phy.ofdm import ResourceGrid
+from sionna.phy.ofdm import ResourceGrid, RZFPrecodedChannel, LMMSEPostEqualizationSINR
 from sionna.phy.utils import dbm_to_watt
 
 from functions.utils import *
@@ -89,6 +89,27 @@ def build_simulator(num_ut_per_sector: int,
 
     return sls
 
+def _compute_logdet_capacity_from_precoded_channel(h_eff_target_rx: torch.Tensor,
+                                                   no: torch.Tensor,
+                                                   target_tx: int,
+                                                   desired_stream_indices: torch.Tensor) -> torch.Tensor:
+    """Compute combiner-agnostic capacity using log2 det(I + R^{-1} S)."""
+    h = h_eff_target_rx.permute(0, 4, 5, 2, 3, 1)
+    # [batch, ofdm, subc, num_tx, num_streams_per_tx, num_rx_ant]
+    cov_per_stream = torch.einsum('...m,...n->...mn', h, torch.conj(h))
+    # [batch, ofdm, subc, num_tx, num_streams_per_tx, num_rx_ant, num_rx_ant]
+
+    signal_cov = torch.sum(cov_per_stream[:, :, :, target_tx, desired_stream_indices, :, :], dim=3)
+    total_cov = torch.sum(cov_per_stream, dim=(3, 4))
+    interf_cov = total_cov - signal_cov
+
+    nr = h_eff_target_rx.shape[1]
+    eye = torch.eye(nr, dtype=h_eff_target_rx.dtype, device=h_eff_target_rx.device).view(
+        1, 1, 1, nr, nr)
+    r_cov = interf_cov + no * eye
+    cap_arg = eye + torch.linalg.solve(r_cov, signal_cov)
+    _, logdet = torch.linalg.slogdet(cap_arg)
+    return (logdet / np.log(2.0)).real
 
 def compute_drop_log_capacity_samples(sls: SystemLevelSimulator,
                                       num_ut_per_sector: int,
@@ -127,26 +148,56 @@ def compute_drop_log_capacity_samples(sls: SystemLevelSimulator,
     if target_bs < 0 or target_bs >= sls.num_bs:
         raise ValueError(f'target_sector_index must be in [0, {sls.num_bs - 1}], got {target_bs}')
 
-    slot_samples = []
+    zf_precoder = RZFPrecodedChannel(resource_grid=rg,
+                                     stream_management=sls.stream_management)
+    zf_alpha = torch.zeros(1, dtype=sls.dtype, device=sls.device)
+    lmmse_posteq_sinr = LMMSEPostEqualizationSINR(resource_grid=rg,
+                                                  stream_management=sls.stream_management)
+
+    # tx_power: [batch_size, num_bs, num_tx_per_sector,
+    #            num_streams_per_tx, num_ofdm_sym, num_subcarriers]
+    # Flatten across sectors
+    # [batch_size, num_tx, num_streams_per_tx, num_ofdm_symbols, num_subcarriers]
+    s = tx_power.shape
+    tx_power = torch.reshape(tx_power, [s[0], s[1]*s[2]] + list(s[3:]))
+
+    slot_stream_sum_samples = []
+    slot_logdet_samples = []
     for slot in range(num_slots):
         h_freq = sls.channel_matrix.update(sls.channel_model, h_freq, slot)
         h_freq_fading = sls.channel_matrix.apply_fading(h_freq)
 
-        sinr = get_sinr(tx_power=tx_power,
-                        stream_management=sls.stream_management,
-                        no=sls.no,
-                        direction=sls.direction,
-                        h_freq_fading=h_freq_fading,
-                        num_bs=sls.num_bs,
-                        num_ut_per_sector=num_ut_per_sector,
-                        num_streams_per_ut=num_streams_per_ut,
-                        resource_grid=rg)
+        h_eff = zf_precoder(h_freq_fading, tx_power=tx_power, alpha=zf_alpha)
 
-        # [batch, num_ofdm_sym, num_subcarriers, num_ut_per_sector, num_streams_per_ut]
+        # [batch, num_ofdm_sym, num_subcarriers, num_rx, num_streams_per_rx]
+        sinr = lmmse_posteq_sinr(h_eff, no=sls.no, interference_whitening=True)
+        # [batch, num_ofdm_sym, num_subcarriers, num_bs, num_ut_per_sector, num_streams_per_ut]
+        sinr = torch.reshape(
+            sinr,
+            list(sinr.shape[:-2]) + [sls.num_bs, num_ut_per_sector, num_streams_per_ut])
+        # [batch, num_bs, num_ofdm_sym, num_subcarriers, num_ut_per_sector, num_streams_per_ut]
+        sinr = torch.permute(sinr, [0, 3, 1, 2, 4, 5])
         target_sinr = sinr[:, target_bs, :, :, :, :]
 
-        log_capacity = torch.log2(1.0 + torch.clamp(target_sinr, min=0.0))
-        slot_samples.append(log_capacity.detach().cpu().numpy().ravel())
+        # Per-UE rate metric: sum_s log2(1 + SINR_s), per RE.
+        stream_sum_rate = torch.sum(
+            torch.log2(1.0 + torch.clamp(target_sinr, min=0.0)), dim=-1)
+        slot_stream_sum_samples.append(stream_sum_rate.detach().cpu().numpy().ravel())
+
+        # Combiner-agnostic alternative for each UE in the target sector.
+        for ut_idx in range(num_ut_per_sector):
+            target_rx = target_bs * num_ut_per_sector + ut_idx
+            start = ut_idx * num_streams_per_ut
+            end = (ut_idx + 1) * num_streams_per_ut
+            desired_stream_indices = torch.arange(
+                start, end, dtype=torch.long, device=sls.device)
+            h_eff_target_rx = h_eff[:, target_rx, :, :, :, :, :]
+            logdet_rate = _compute_logdet_capacity_from_precoded_channel(
+                h_eff_target_rx=h_eff_target_rx,
+                no=sls.no,
+                target_tx=target_bs,
+                desired_stream_indices=desired_stream_indices)
+            slot_logdet_samples.append(logdet_rate.detach().cpu().numpy().ravel())
 
         # Match slot-wise behavior used in e2e_example.py.
         sls.ut_loc = sls.ut_loc + sls.ut_velocities * sls.slot_duration
@@ -155,7 +206,7 @@ def compute_drop_log_capacity_samples(sls: SystemLevelSimulator,
             sls.bs_orientations, sls.ut_velocities,
             sls.in_state, sls.los, sls.bs_virtual_loc)
 
-    return np.concatenate(slot_samples)
+    return np.concatenate(slot_stream_sum_samples), np.concatenate(slot_logdet_samples)
 
 
 def main():
@@ -181,7 +232,8 @@ def main():
     bs_max_power_dbm = 56.0
     ut_max_power_dbm = 26.0
 
-    all_samples = []
+    all_stream_sum_samples = []
+    all_logdet_samples = []
 
     for drop_idx in range(args.num_drops):
         sionna.phy.config.seed = args.seed + drop_idx
@@ -199,24 +251,29 @@ def main():
             bs_max_power_dbm=bs_max_power_dbm,
             ut_max_power_dbm=ut_max_power_dbm)
 
-        samples = compute_drop_log_capacity_samples(
+        stream_sum_samples, logdet_samples = compute_drop_log_capacity_samples(
             sls=sls,
             num_ut_per_sector=num_ut_per_sector,
             num_streams_per_ut=num_streams_per_ut,
             num_slots=args.num_slots,
             target_sector_index=args.target_sector_index)
-        all_samples.append(samples)
+        all_stream_sum_samples.append(stream_sum_samples)
+        all_logdet_samples.append(logdet_samples)
 
         if (drop_idx + 1) % 10 == 0:
             print(f'Processed {drop_idx + 1}/{args.num_drops} drops')
 
-    all_samples = np.concatenate(all_samples)
-    x, y = get_cdf(all_samples)
+    all_stream_sum_samples = np.concatenate(all_stream_sum_samples)
+    all_logdet_samples = np.concatenate(all_logdet_samples)
+    x_stream, y_stream = get_cdf(all_stream_sum_samples)
+    x_logdet, y_logdet = get_cdf(all_logdet_samples)
 
     plt.figure(figsize=(6, 4))
-    plt.plot(x, y, linewidth=2)
-    plt.xlabel('log2(1 + SINR) [bits/s/Hz]')
+    plt.plot(x_stream, y_stream, linewidth=2, label='Sum over streams: log2(1+SINR_s)')
+    plt.plot(x_logdet, y_logdet, linewidth=2, linestyle='--', label='log2 det(I + R^-1 S)')
+    plt.xlabel('Rate [bits/s/Hz]')
     plt.ylabel('CDF')
+    plt.legend()
     plt.title(f'MU-MIMO ZF: CDF over {args.num_drops} drops × {args.num_slots} slots')
     plt.grid(True, alpha=0.3)
     plt.tight_layout()

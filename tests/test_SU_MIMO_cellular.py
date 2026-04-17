@@ -29,7 +29,7 @@ except ImportError as e:
     raise e
 
 from sionna.phy.channel.tr38901 import PanelArray
-from sionna.phy.ofdm import ResourceGrid, RZFPrecodedChannel
+from sionna.phy.ofdm import ResourceGrid, RZFPrecodedChannel, LMMSEPostEqualizationSINR
 from sionna.phy.utils import dbm_to_watt
 
 from functions.utils import *
@@ -90,6 +90,38 @@ def build_simulator(num_ut_per_sector: int,
     return sls
 
 
+def _compute_logdet_capacity_from_precoded_channel(h_eff_target_rx: torch.Tensor,
+                                                   no: torch.Tensor,
+                                                   target_tx: int) -> torch.Tensor:
+    """Compute combiner-agnostic capacity using a log-det formula.
+
+    h_eff_target_rx shape:
+      [batch, num_rx_ant, num_tx, num_streams_per_tx, num_ofdm_sym, num_subcarriers]
+
+    Uses: log2 det(I + R^{-1} S), where
+      S = H_target F_target P_target F_target^H H_target^H
+      R = sum_{interferers} H_i F_i P_i F_i^H H_i^H + no*I.
+    Here, H_i F_i sqrt(P_i) is represented directly by h_eff_target_rx slices.
+    """
+    h = h_eff_target_rx.permute(0, 4, 5, 2, 3, 1)
+    # [batch, ofdm, subc, num_tx, num_streams_per_tx, num_rx_ant]
+    hh = torch.einsum('...m,...n->...mn', h, torch.conj(h))
+    # [batch, ofdm, subc, num_tx, num_streams_per_tx, num_rx_ant, num_rx_ant]
+    cov_per_stream = hh
+
+    signal_cov = torch.sum(cov_per_stream[:, :, :, target_tx, :, :, :], dim=3)
+    # Sum all streams from all TX then subtract desired TX streams.
+    total_cov = torch.sum(cov_per_stream, dim=(3, 4))
+    interf_cov = total_cov - signal_cov
+
+    nr = h_eff_target_rx.shape[1]
+    eye = torch.eye(nr, dtype=h_eff_target_rx.dtype, device=h_eff_target_rx.device).view(
+        1, 1, 1, nr, nr)
+    r_cov = interf_cov + no * eye
+    cap_arg = eye + torch.linalg.solve(r_cov, signal_cov)
+    _, logdet = torch.linalg.slogdet(cap_arg)
+    return (logdet / np.log(2.0)).real
+
 def compute_drop_log_capacity_samples(sls: SystemLevelSimulator,
                                       num_streams_per_ut: int,
                                       num_slots: int,
@@ -122,6 +154,8 @@ def compute_drop_log_capacity_samples(sls: SystemLevelSimulator,
     zf_precoder = RZFPrecodedChannel(resource_grid=rg,
                                      stream_management=sls.stream_management)
     zf_alpha = torch.zeros(1, dtype=sls.dtype, device=sls.device)
+    lmmse_posteq_sinr = LMMSEPostEqualizationSINR(resource_grid=rg,
+                                                  stream_management=sls.stream_management)
     
     # tx_power: [batch_size, num_bs, num_tx_per_sector,
     #            num_streams_per_tx, num_ofdm_sym, num_subcarriers]
@@ -135,7 +169,8 @@ def compute_drop_log_capacity_samples(sls: SystemLevelSimulator,
     if target_bs < 0 or target_bs >= sls.num_bs:
         raise ValueError(f'target_sector_index must be in [0, {sls.num_bs - 1}], got {target_bs}')
     
-    slot_samples = []
+    slot_stream_sum_samples = []
+    slot_logdet_samples = []
     for slot in range(num_slots):
         h_freq = sls.channel_matrix.update(sls.channel_model, h_freq, slot)
         h_freq_fading = sls.channel_matrix.apply_fading(h_freq)
@@ -152,24 +187,24 @@ def compute_drop_log_capacity_samples(sls: SystemLevelSimulator,
         target_rx = target_bs * sls.num_ut_per_sector
         target_tx = target_bs
 
-        # Compute per-stream SINR directly from effective channel G (no post-equalization vector u):
-        #   SINR_m = |G_{target_rx, :, target_tx, m}|^2
-        #            / (sum_{(b,j)!=(target_tx,m)} |G_{target_rx, :, b, j}|^2 + no)
-        # 1) Power per receive antenna is accumulated to form scalar stream powers.
-        stream_power = torch.sum(torch.abs(h_eff) ** 2, dim=2)
-        # [batch, num_tx, num_streams_per_tx, num_ofdm_sym, num_subcarriers]
-        rx_power = stream_power[:, target_rx, :, :, :, :]
-        # [batch, num_streams_per_tx, num_ofdm_sym, num_subcarriers]
-        signal = rx_power[:, target_tx, :, :, :]
-        # [batch, num_ofdm_sym, num_subcarriers]
-        total_power = torch.sum(rx_power, dim=(1, 2))
-        # [batch, num_streams_per_tx, num_ofdm_sym, num_subcarriers]
-        interference = torch.clamp(total_power.unsqueeze(1) - signal, min=0.0)
-        sinr_target = signal / (interference + sls.no)
+        # Post-combining per-stream SINR via LMMSE combiner.
+        # [batch, num_ofdm_sym, num_subcarriers, num_rx, num_streams_per_rx]
+        sinr = lmmse_posteq_sinr(h_eff, no=sls.no, interference_whitening=True)
+        # [batch, num_ofdm_sym, num_subcarriers, num_streams_per_ut]
+        sinr_target = sinr[:, :, :, target_rx, :]
+        # Sum_s log2(1 + SINR_s), per RE.
+        stream_sum_rate = torch.sum(
+            torch.log2(1.0 + torch.clamp(sinr_target, min=0.0)), dim=-1)
+        slot_stream_sum_samples.append(stream_sum_rate.detach().cpu().numpy().ravel())
 
-        # Capacity-like metric in bits/s/Hz per stream per RE.
-        log_capacity = torch.log2(1.0 + torch.clamp(sinr_target, min=0.0))
-        slot_samples.append(log_capacity.detach().cpu().numpy().ravel())
+        # Alternative combiner-agnostic rate: log2 det(I + R^{-1} S).
+        # Use target RX antenna-domain effective channels.
+        h_eff_target_rx = h_eff[:, target_rx, :, :, :, :, :]
+        logdet_rate = _compute_logdet_capacity_from_precoded_channel(
+            h_eff_target_rx=h_eff_target_rx,
+            no=sls.no,
+            target_tx=target_tx)
+        slot_logdet_samples.append(logdet_rate.detach().cpu().numpy().ravel())
 
         # Match slot-wise behavior used in e2e_example.py.
         sls.ut_loc = sls.ut_loc + sls.ut_velocities * sls.slot_duration
@@ -178,7 +213,7 @@ def compute_drop_log_capacity_samples(sls: SystemLevelSimulator,
             sls.bs_orientations, sls.ut_velocities,
             sls.in_state, sls.los, sls.bs_virtual_loc)
 
-    return np.concatenate(slot_samples)
+    return np.concatenate(slot_stream_sum_samples), np.concatenate(slot_logdet_samples)
 
 def main():
     parser = argparse.ArgumentParser(description='SU-MIMO cellular ZF SINR CDF experiment')
@@ -203,7 +238,8 @@ def main():
     bs_max_power_dbm = 56.0
     ut_max_power_dbm = 26.0
 
-    all_samples = []
+    all_stream_sum_samples = []
+    all_logdet_samples = []
 
     for drop_idx in range(args.num_drops):
         sionna.phy.config.seed = args.seed + drop_idx
@@ -221,24 +257,29 @@ def main():
             bs_max_power_dbm=bs_max_power_dbm,
             ut_max_power_dbm=ut_max_power_dbm)
 
-        samples = compute_drop_log_capacity_samples(
+        stream_sum_samples, logdet_samples = compute_drop_log_capacity_samples(
             sls=sls,
             num_streams_per_ut=num_streams_per_ut,
             num_slots=args.num_slots,
             target_sector_index=args.target_sector_index)
-        all_samples.append(samples)
+        all_stream_sum_samples.append(stream_sum_samples)
+        all_logdet_samples.append(logdet_samples)
 
         if (drop_idx + 1) % 10 == 0:
             print(f'Processed {drop_idx + 1}/{args.num_drops} drops')
 
-    all_samples = np.concatenate(all_samples)
-    x, y = get_cdf(all_samples)
+    all_stream_sum_samples = np.concatenate(all_stream_sum_samples)
+    all_logdet_samples = np.concatenate(all_logdet_samples)
+    x_stream, y_stream = get_cdf(all_stream_sum_samples)
+    x_logdet, y_logdet = get_cdf(all_logdet_samples)
 
     plt.figure(figsize=(6, 4))
-    plt.plot(x, y, linewidth=2)
-    plt.xlabel('log2(1 + SINR) [bits/s/Hz]')
+    plt.plot(x_stream, y_stream, linewidth=2, label='Sum over streams: log2(1+SINR_s)')
+    plt.plot(x_logdet, y_logdet, linewidth=2, linestyle='--', label='log2 det(I + R^-1 S)')
+    plt.xlabel('Rate [bits/s/Hz]')
     plt.ylabel('CDF')
     plt.title(f'SU-MIMO ZF: CDF over {args.num_drops} drops × {args.num_slots} slots')
+    plt.legend()
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
     plt.savefig(args.out, dpi=300)
