@@ -47,7 +47,7 @@ def build_simulator(num_ut_per_sector: int,
                     bs_max_power_dbm: float,
                     ut_max_power_dbm: float):
     bs_array = PanelArray(num_rows_per_panel=2,
-                          num_cols_per_panel=3,
+                          num_cols_per_panel=4,
                           polarization='dual',
                           polarization_type='VH',
                           antenna_pattern='38.901',
