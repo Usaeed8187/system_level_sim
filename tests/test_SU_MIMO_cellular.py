@@ -92,9 +92,15 @@ def build_simulator(num_ut_per_sector: int,
 
 def compute_drop_log_capacity_samples(sls: SystemLevelSimulator,
                                       num_streams_per_ut: int,
+                                      num_slots: int,
                                       target_sector_index: int = 0):
+    
+    if num_slots < 1:
+        raise ValueError(f'num_slots must be >= 1, got {num_slots}')
+
+    sls.channel_matrix.reset()
+
     h_freq = sls.channel_matrix(sls.channel_model)
-    h_freq_fading = sls.channel_matrix.apply_fading(h_freq)
 
     rg = sls.resource_grid
     total_tx_power_watt = dbm_to_watt(sls.bs_max_power_dbm)
@@ -124,37 +130,52 @@ def compute_drop_log_capacity_samples(sls: SystemLevelSimulator,
     s = tx_power.shape
     tx_power = torch.reshape(tx_power, [s[0], s[1]*s[2]] + list(s[3:]))
     
-    h_eff = zf_precoder(h_freq_fading, tx_power=tx_power, alpha=zf_alpha)
-
-    lmmse_posteq_sinr = LMMSEPostEqualizationSINR(resource_grid=rg,
-                                                  stream_management=sls.stream_management)
-    sinr = lmmse_posteq_sinr(h_eff, no=sls.no, interference_whitening=True)
-
-    sinr = torch.reshape(
-        sinr,
-        [sls.batch_size,
-         rg.num_ofdm_symbols,
-         rg.fft_size,
-         sls.num_bs,
-         sls.num_ut_per_sector,
-         num_streams_per_ut])
-    sinr = torch.permute(sinr, [0, 3, 1, 2, 4, 5])
+    lmmse_posteq_sinr = LMMSEPostEqualizationSINR(
+        resource_grid=rg,
+        stream_management=sls.stream_management)
 
     # Deterministic arbitrary choice: select a fixed global sector index.
     target_bs = int(target_sector_index)
     if target_bs < 0 or target_bs >= sls.num_bs:
         raise ValueError(f'target_sector_index must be in [0, {sls.num_bs - 1}], got {target_bs}')
+    
+    slot_samples = []
+    for slot in range(num_slots):
+        h_freq = sls.channel_matrix.update(sls.channel_model, h_freq, slot)
+        h_freq_fading = sls.channel_matrix.apply_fading(h_freq)
 
-    sinr_target = sinr[:, target_bs, :, :, 0, :]
+        h_eff = zf_precoder(h_freq_fading, tx_power=tx_power, alpha=zf_alpha)
+        sinr = lmmse_posteq_sinr(h_eff, no=sls.no, interference_whitening=True)
 
-    # Capacity-like metric in nats/s/Hz per stream per RE.
-    log_capacity = torch.log1p(torch.clamp(sinr_target, min=0.0))
-    return log_capacity.detach().cpu().numpy().ravel()
+        sinr = torch.reshape(
+            sinr,
+            [sls.batch_size,
+             rg.num_ofdm_symbols,
+             rg.fft_size,
+             sls.num_bs,
+             sls.num_ut_per_sector,
+             num_streams_per_ut])
+        sinr = torch.permute(sinr, [0, 3, 1, 2, 4, 5])
+        sinr_target = sinr[:, target_bs, :, :, 0, :]
 
+        # Capacity-like metric in nats/s/Hz per stream per RE.
+        log_capacity = torch.log1p(torch.clamp(sinr_target, min=0.0))
+        slot_samples.append(log_capacity.detach().cpu().numpy().ravel())
+
+        # Match slot-wise behavior used in e2e_example.py.
+        sls.ut_loc = sls.ut_loc + sls.ut_velocities * sls.slot_duration
+        sls.channel_model.set_topology(
+            sls.ut_loc, sls.bs_loc, sls.ut_orientations,
+            sls.bs_orientations, sls.ut_velocities,
+            sls.in_state, sls.los, sls.bs_virtual_loc)
+
+    return np.concatenate(slot_samples)
 
 def main():
     parser = argparse.ArgumentParser(description='SU-MIMO cellular ZF SINR CDF experiment')
     parser.add_argument('--num-drops', type=int, default=10)
+    parser.add_argument('--num-slots', type=int, default=10,
+                        help='Number of slots simulated per drop (default: 10)')
     parser.add_argument('--num-rings', type=int, default=2)
     parser.add_argument('--num-ofdm-sym', type=int, default=1)
     parser.add_argument('--num-subcarriers', type=int, default=128)
@@ -194,10 +215,11 @@ def main():
         samples = compute_drop_log_capacity_samples(
             sls=sls,
             num_streams_per_ut=num_streams_per_ut,
+            num_slots=args.num_slots,
             target_sector_index=args.target_sector_index)
         all_samples.append(samples)
 
-        if (drop_idx + 1) % 50 == 0:
+        if (drop_idx + 1) % 10 == 0:
             print(f'Processed {drop_idx + 1}/{args.num_drops} drops')
 
     all_samples = np.concatenate(all_samples)
@@ -207,7 +229,7 @@ def main():
     plt.plot(x, y, linewidth=2)
     plt.xlabel('log(1 + SINR)')
     plt.ylabel('CDF')
-    plt.title(f'SU-MIMO ZF: CDF over {args.num_drops} drops')
+    plt.title(f'SU-MIMO ZF: CDF over {args.num_drops} drops × {args.num_slots} slots')
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
     plt.savefig(args.out, dpi=300)
