@@ -318,7 +318,7 @@ def main():
     plt.xlabel('Sector throughput [bits/s/Hz per RE]')
     plt.ylabel('CDF')
     plt.legend()
-    plt.title(f'MU-MIMO ZF sector sum throughput: CDF over {args.num_drops} drops × {args.num_slots} slots')
+    plt.title(f'MU-MIMO sector sum throughput: CDF over {args.num_drops} drops x {args.num_slots} slots')
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
     plt.savefig(args.out, dpi=300)
