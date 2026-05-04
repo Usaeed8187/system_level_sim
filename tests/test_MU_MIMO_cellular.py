@@ -30,7 +30,7 @@ except ImportError as e:
 
 from sionna.phy.channel.tr38901 import PanelArray
 from sionna.phy.ofdm import ResourceGrid, RZFPrecodedChannel, LMMSEPostEqualizationSINR
-from functions.slnr_precoder import StreamSLNRPrecodedChannel
+from functions.slnr_precoder import UESLNRPrecodedChannel
 from sionna.phy.utils import dbm_to_watt
 
 from functions.utils import *
@@ -155,8 +155,8 @@ def compute_drop_log_capacity_samples(sls: SystemLevelSimulator,
         precoded_channel = RZFPrecodedChannel(resource_grid=rg,
                                               stream_management=sls.stream_management)
     elif precoder == 'slnr':
-        precoded_channel = StreamSLNRPrecodedChannel(resource_grid=rg,
-                                                     stream_management=sls.stream_management)
+        precoded_channel = UESLNRPrecodedChannel(resource_grid=rg,
+                                                 stream_management=sls.stream_management)
     else:
         raise ValueError(f"Unsupported precoder '{precoder}'. Use 'rzf' or 'slnr'.")
     precoder_alpha = torch.zeros(1, dtype=sls.dtype, device=sls.device)
