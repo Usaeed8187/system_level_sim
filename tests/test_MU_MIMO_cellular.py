@@ -117,7 +117,8 @@ def compute_drop_log_capacity_samples(sls: SystemLevelSimulator,
                                       num_streams_per_ut: int,
                                       num_slots: int,
                                       target_sector_index: int = 0,
-                                      precoder: str = 'rzf'):
+                                      precoder: str = 'rzf',
+                                      diagnostics: bool = False):
 
     if num_slots < 1:
         raise ValueError(f'num_slots must be >= 1, got {num_slots}')
@@ -151,14 +152,14 @@ def compute_drop_log_capacity_samples(sls: SystemLevelSimulator,
         raise ValueError(f'target_sector_index must be in [0, {sls.num_bs - 1}], got {target_bs}')
 
     if precoder == 'rzf':
-        zf_precoder = RZFPrecodedChannel(resource_grid=rg,
-                                         stream_management=sls.stream_management)
+        precoded_channel = RZFPrecodedChannel(resource_grid=rg,
+                                              stream_management=sls.stream_management)
     elif precoder == 'slnr':
-        zf_precoder = StreamSLNRPrecodedChannel(resource_grid=rg,
-                                                stream_management=sls.stream_management)
+        precoded_channel = StreamSLNRPrecodedChannel(resource_grid=rg,
+                                                     stream_management=sls.stream_management)
     else:
         raise ValueError(f"Unsupported precoder '{precoder}'. Use 'rzf' or 'slnr'.")
-    zf_alpha = torch.zeros(1, dtype=sls.dtype, device=sls.device)
+    precoder_alpha = torch.zeros(1, dtype=sls.dtype, device=sls.device)
     lmmse_posteq_sinr = LMMSEPostEqualizationSINR(resource_grid=rg,
                                                   stream_management=sls.stream_management)
 
@@ -175,7 +176,7 @@ def compute_drop_log_capacity_samples(sls: SystemLevelSimulator,
         h_freq = sls.channel_matrix.update(sls.channel_model, h_freq, slot)
         h_freq_fading = sls.channel_matrix.apply_fading(h_freq)
 
-        h_eff = zf_precoder(h_freq_fading, tx_power=tx_power, alpha=zf_alpha)
+        h_eff = precoded_channel(h_freq_fading, tx_power=tx_power, alpha=precoder_alpha)
 
         # [batch, num_ofdm_sym, num_subcarriers, num_rx, num_streams_per_rx]
         sinr = lmmse_posteq_sinr(h_eff, no=sls.no, interference_whitening=True)
@@ -186,6 +187,26 @@ def compute_drop_log_capacity_samples(sls: SystemLevelSimulator,
         # [batch, num_bs, num_ofdm_sym, num_subcarriers, num_ut_per_sector, num_streams_per_ut]
         sinr = torch.permute(sinr, [0, 3, 1, 2, 4, 5])
         target_sinr = sinr[:, target_bs, :, :, :, :]
+
+        if diagnostics:
+            sinr_neg_frac = torch.mean((target_sinr < 0).to(sls.dtype)).item()
+            sinr_mean_lin = torch.mean(target_sinr).item()
+            sinr_mean_db = 10.0 * np.log10(max(sinr_mean_lin, 1e-30))
+            h_target = h_eff[:, target_bs*num_ut_per_sector:(target_bs+1)*num_ut_per_sector, :, :, :, :, :]
+            h_target = h_target.permute(0, 1, 4, 3, 5, 6, 2)
+            cov_per_stream = torch.einsum('...m,...n->...mn', h_target, torch.conj(h_target))
+            total_cov = torch.sum(cov_per_stream, dim=(1, 3, 4))
+            desired_cov = torch.sum(cov_per_stream[:, :, :, target_bs, :, :, :], dim=(1, 3))
+            interference_cov = total_cov - desired_cov
+            desired_power = torch.mean(torch.diagonal(desired_cov, dim1=-2, dim2=-1).real).item()
+            interference_power = torch.mean(torch.diagonal(interference_cov, dim1=-2, dim2=-1).real).item()
+            print(
+                f"[diag] slot={slot} precoder={precoder} "
+                f"mean|h_eff|={torch.mean(torch.abs(h_eff)).item():.3e} "
+                f"mean_sinr_lin={sinr_mean_lin:.3e} mean_sinr_db={sinr_mean_db:.2f} "
+                f"sinr_neg_frac={sinr_neg_frac:.3f} "
+                f"desired_pow={desired_power:.3e} interference_pow={interference_power:.3e}"
+            )
 
         # Sector sum-throughput metric:
         # sum over streams and users, per RE.
@@ -237,6 +258,8 @@ def main():
                         help='Deterministic global sector index (default: 0)')
     parser.add_argument('--precoder', type=str, default='slnr', choices=['rzf', 'slnr'],
                         help='Precoder type to use (default: rzf)')
+    parser.add_argument('--diagnostics', action='store_true', default=True,
+                        help='Print per-slot diagnostics for effective channel and SINR')
     args = parser.parse_args()
 
     # MU-MIMO setup requested by user
@@ -273,7 +296,8 @@ def main():
             num_streams_per_ut=num_streams_per_ut,
             num_slots=args.num_slots,
             target_sector_index=args.target_sector_index,
-            precoder=args.precoder)
+            precoder=args.precoder,
+            diagnostics=args.diagnostics)
         all_stream_sum_samples.append(stream_sum_samples)
         all_logdet_samples.append(logdet_samples)
 
