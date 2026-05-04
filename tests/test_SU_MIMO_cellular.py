@@ -235,7 +235,7 @@ def main():
     parser.add_argument('--out', type=str, default='./results/su_mimo_log1p_sinr_cdf.png')
     parser.add_argument('--target-sector-index', type=int, default=0,
                         help='Deterministic global sector index (default: 0)')
-    parser.add_argument('--precoder', type=str, default='rzf', choices=['rzf', 'slnr'],
+    parser.add_argument('--precoder', type=str, default='slnr', choices=['rzf', 'slnr'],
                         help='Precoder type to use (default: rzf)')
     args = parser.parse_args()
 
