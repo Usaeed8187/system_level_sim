@@ -30,6 +30,7 @@ except ImportError as e:
 
 from sionna.phy.channel.tr38901 import PanelArray
 from sionna.phy.ofdm import ResourceGrid, RZFPrecodedChannel, LMMSEPostEqualizationSINR
+from functions.slnr_precoder import StreamSLNRPrecodedChannel
 from sionna.phy.utils import dbm_to_watt
 
 from functions.utils import *
@@ -115,7 +116,8 @@ def compute_drop_log_capacity_samples(sls: SystemLevelSimulator,
                                       num_ut_per_sector: int,
                                       num_streams_per_ut: int,
                                       num_slots: int,
-                                      target_sector_index: int = 0):
+                                      target_sector_index: int = 0,
+                                      precoder: str = 'rzf'):
 
     if num_slots < 1:
         raise ValueError(f'num_slots must be >= 1, got {num_slots}')
@@ -148,8 +150,14 @@ def compute_drop_log_capacity_samples(sls: SystemLevelSimulator,
     if target_bs < 0 or target_bs >= sls.num_bs:
         raise ValueError(f'target_sector_index must be in [0, {sls.num_bs - 1}], got {target_bs}')
 
-    zf_precoder = RZFPrecodedChannel(resource_grid=rg,
-                                     stream_management=sls.stream_management)
+    if precoder == 'rzf':
+        zf_precoder = RZFPrecodedChannel(resource_grid=rg,
+                                         stream_management=sls.stream_management)
+    elif precoder == 'slnr':
+        zf_precoder = StreamSLNRPrecodedChannel(resource_grid=rg,
+                                                stream_management=sls.stream_management)
+    else:
+        raise ValueError(f"Unsupported precoder '{precoder}'. Use 'rzf' or 'slnr'.")
     zf_alpha = torch.zeros(1, dtype=sls.dtype, device=sls.device)
     lmmse_posteq_sinr = LMMSEPostEqualizationSINR(resource_grid=rg,
                                                   stream_management=sls.stream_management)
@@ -227,6 +235,8 @@ def main():
     parser.add_argument('--out', type=str, default='./results/mu_mimo_log1p_sinr_cdf.png')
     parser.add_argument('--target-sector-index', type=int, default=0,
                         help='Deterministic global sector index (default: 0)')
+    parser.add_argument('--precoder', type=str, default='rzf', choices=['rzf', 'slnr'],
+                        help='Precoder type to use (default: rzf)')
     args = parser.parse_args()
 
     # MU-MIMO setup requested by user
@@ -262,7 +272,8 @@ def main():
             num_ut_per_sector=num_ut_per_sector,
             num_streams_per_ut=num_streams_per_ut,
             num_slots=args.num_slots,
-            target_sector_index=args.target_sector_index)
+            target_sector_index=args.target_sector_index,
+            precoder=args.precoder)
         all_stream_sum_samples.append(stream_sum_samples)
         all_logdet_samples.append(logdet_samples)
 
