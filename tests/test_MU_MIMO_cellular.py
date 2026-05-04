@@ -159,7 +159,9 @@ def compute_drop_log_capacity_samples(sls: SystemLevelSimulator,
                                                  stream_management=sls.stream_management)
     else:
         raise ValueError(f"Unsupported precoder '{precoder}'. Use 'rzf' or 'slnr'.")
-    precoder_alpha = torch.zeros(1, dtype=sls.dtype, device=sls.device)
+    # Include thermal-noise loading in SLNR/RZF regularization so that
+    # precoder design accounts for both leakage/interference and noise.
+    precoder_alpha = torch.as_tensor(sls.no, dtype=sls.dtype, device=sls.device)
     lmmse_posteq_sinr = LMMSEPostEqualizationSINR(resource_grid=rg,
                                                   stream_management=sls.stream_management)
 

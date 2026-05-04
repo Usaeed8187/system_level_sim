@@ -21,7 +21,9 @@ def ue_slnr_precoding_matrix(
     num_streams_per_ue : int
         Number of streams assigned to each UE.
     alpha : float | torch.Tensor
-        Regularization term added to leakage covariance.
+        Regularization term added to leakage covariance. Set this to noise
+        power (or a scaled variant) to include thermal noise in the SLNR
+        formulation.
     precision : Optional[str]
         Sionna precision identifier.
 
