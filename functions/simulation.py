@@ -11,10 +11,54 @@ from sionna.phy.constants import BOLTZMANN_CONSTANT
 
 from sionna.phy.channel.tr38901 import UMi, UMa, RMa
 from sionna.phy import Block
+import matplotlib.pyplot as plt
 
 CENTER_CELL_NUM_SECTORS = 3
 
+class CenterCellGrid(torch.nn.Module):
+    """Grid view for center-cell-only mode with explicit center-cell plotting."""
 
+    def __init__(self, full_grid, bs_loc, ut_loc):
+        super().__init__()
+        self.full_grid = full_grid
+        self.bs_loc = bs_loc
+        self.ut_loc = ut_loc
+
+    def show(self):
+        bs_loc_np = self.bs_loc.cpu().numpy() if hasattr(self.bs_loc, 'cpu') else self.bs_loc
+        ut_loc_np = self.ut_loc.cpu().numpy() if hasattr(self.ut_loc, 'cpu') else self.ut_loc
+
+        bs_x = bs_loc_np[0, :, 0]
+        bs_y = bs_loc_np[0, :, 1]
+        ut_x = ut_loc_np[0, :, 0]
+        ut_y = ut_loc_np[0, :, 1]
+
+        x_center = float(bs_x.mean())
+        y_center = float(bs_y.mean())
+
+        hex_radius = float(self.full_grid._isd / np.sqrt(3.0))
+        vertex_angles = np.linspace(0.0, 2.0*np.pi, 7) + np.pi / 6.0
+        hex_x = x_center + hex_radius*np.cos(vertex_angles)
+        hex_y = y_center + hex_radius*np.sin(vertex_angles)
+
+        fig, ax = plt.subplots(1, 1)
+        ax.plot(hex_x, hex_y, color='b')
+        ax.scatter(bs_x, bs_y, color='b', label='base cell')
+        # Keep UE legend off here because some callers (tests) add their own UE
+        # overlay/label after calling grid.show(), which would otherwise create
+        # duplicate "user position" legend entries.
+        ax.scatter(ut_x, ut_y, color='k', marker='x', label='_nolegend_')
+
+        margin = 0.1 * hex_radius
+        ax.set_xlim(x_center - hex_radius - margin, x_center + hex_radius + margin)
+        ax.set_ylim(y_center - hex_radius - margin, y_center + hex_radius + margin)
+        ax.set_aspect('equal', adjustable='box')
+        handles, labels = ax.get_legend_handles_labels()
+        unique = dict(zip(labels, handles))
+        ax.legend(unique.values(), unique.keys())
+
+        return fig
+    
 class SystemLevelSimulator(Block):
     def __init__(self,
                  batch_size,
@@ -210,6 +254,7 @@ class SystemLevelSimulator(Block):
 
         if self.center_cell_only:
             self._slice_center_cell_topology()
+            self.grid = CenterCellGrid(self.grid, self.bs_loc, self.ut_loc)
 
         self.channel_model.set_topology(
             self.ut_loc, self.bs_loc, self.ut_orientations,
