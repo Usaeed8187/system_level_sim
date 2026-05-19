@@ -30,7 +30,7 @@ except ImportError as e:
 
 from sionna.phy.channel.tr38901 import PanelArray
 from sionna.phy.ofdm import ResourceGrid, RZFPrecodedChannel, LMMSEPostEqualizationSINR
-from functions.slnr_precoder import StreamSLNRPrecodedChannel
+from functions.slnr_precoder import UESLNRPrecodedChannel
 from sionna.phy.utils import dbm_to_watt
 
 from functions.utils import *
@@ -228,14 +228,14 @@ def main():
     parser.add_argument('--num-drops', type=int, default=10)
     parser.add_argument('--num-slots', type=int, default=10,
                         help='Number of slots simulated per drop (default: 10)')
-    parser.add_argument('--num-rings', type=int, default=2)
+    parser.add_argument('--num-rings', type=int, default=0)
     parser.add_argument('--num-ofdm-sym', type=int, default=1)
     parser.add_argument('--num-subcarriers', type=int, default=128)
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--out', type=str, default='./results/su_mimo_log1p_sinr_cdf.png')
     parser.add_argument('--target-sector-index', type=int, default=0,
                         help='Deterministic global sector index (default: 0)')
-    parser.add_argument('--precoder', type=str, default='slnr', choices=['rzf', 'slnr'],
+    parser.add_argument('--precoder', type=str, default='rzf', choices=['rzf', 'slnr'],
                         help='Precoder type to use (default: rzf)')
     args = parser.parse_args()
 

@@ -203,11 +203,11 @@ def compute_drop_log_capacity_samples(sls: SystemLevelSimulator,
             desired_power = torch.mean(torch.diagonal(desired_cov, dim1=-2, dim2=-1).real).item()
             interference_power = torch.mean(torch.diagonal(interference_cov, dim1=-2, dim2=-1).real).item()
             print(
-                f"[diag] slot={slot} precoder={precoder} "
+                f"[debug] slot={slot} precoder={precoder} "
                 f"mean|h_eff|={torch.mean(torch.abs(h_eff)).item():.3e} "
-                f"mean_sinr_lin={sinr_mean_lin:.3e} mean_sinr_db={sinr_mean_db:.2f} "
-                f"sinr_neg_frac={sinr_neg_frac:.3f} "
-                f"desired_pow={desired_power:.3e} interference_pow={interference_power:.3e}"
+                f"mean_sinr_db={sinr_mean_db:.2f} "
+                # f"sinr_neg_frac={sinr_neg_frac:.3f} "
+                # f"desired_pow={desired_power:.3e} interference_pow={interference_power:.3e}"
             )
 
         # Sector sum-throughput metric:
@@ -251,14 +251,14 @@ def main():
     parser.add_argument('--num-drops', type=int, default=10)
     parser.add_argument('--num-slots', type=int, default=10,
                         help='Number of slots simulated per drop (default: 10)')
-    parser.add_argument('--num-rings', type=int, default=2)
+    parser.add_argument('--num-rings', type=int, default=0)
     parser.add_argument('--num-ofdm-sym', type=int, default=1)
     parser.add_argument('--num-subcarriers', type=int, default=128)
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--out', type=str, default='./results/mu_mimo_log1p_sinr_cdf.png')
     parser.add_argument('--target-sector-index', type=int, default=0,
                         help='Deterministic global sector index (default: 0)')
-    parser.add_argument('--precoder', type=str, default='slnr', choices=['rzf', 'slnr'],
+    parser.add_argument('--precoder', type=str, default='rzf', choices=['rzf', 'slnr'],
                         help='Precoder type to use (default: rzf)')
     parser.add_argument('--diagnostics', action='store_true', default=True,
                         help='Print per-slot diagnostics for effective channel and SINR')
@@ -291,6 +291,15 @@ def main():
             num_rings=args.num_rings,
             bs_max_power_dbm=bs_max_power_dbm,
             ut_max_power_dbm=ut_max_power_dbm)
+        
+        print("requested_num_rings:", sls.requested_num_rings)
+        print("center_cell_only:", sls.center_cell_only)
+        print("topology_num_rings:", sls.topology_num_rings)
+        print("num_bs:", sls.num_bs)
+        print("num_ut:", sls.num_ut)
+        print("bs_loc shape:", sls.bs_loc.shape)
+        print("ut_loc shape:", sls.ut_loc.shape)
+        print("bs_virtual_loc shape:", sls.bs_virtual_loc.shape)
 
         stream_sum_samples, logdet_samples = compute_drop_log_capacity_samples(
             sls=sls,

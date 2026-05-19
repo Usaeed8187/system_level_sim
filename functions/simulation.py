@@ -12,6 +12,7 @@ from sionna.phy.constants import BOLTZMANN_CONSTANT
 from sionna.phy.channel.tr38901 import UMi, UMa, RMa
 from sionna.phy import Block
 
+CENTER_CELL_NUM_SECTORS = 3
 
 
 class SystemLevelSimulator(Block):
@@ -48,8 +49,23 @@ class SystemLevelSimulator(Block):
         self.bs_max_power_dbm = bs_max_power_dbm
         self.ut_max_power_dbm = ut_max_power_dbm
         self.coherence_time = int(coherence_time)
-        num_cells = get_num_hex_in_grid(num_rings)
-        self.num_bs = num_cells * 3
+
+        # Sionna's built-in HexGrid requires num_rings > 0. We use
+        # num_rings == 0 as a custom, efficient "center cell only" mode:
+        # generate a valid num_rings=1 topology internally, then slice it to
+        # keep only the 3 sectors and UEs of the center cell before the
+        # topology is applied to the channel model and before ChannelMatrix is created.
+        self.requested_num_rings = int(num_rings)
+        self.center_cell_only = (self.requested_num_rings == 0)
+        self.topology_num_rings = 1 if self.center_cell_only else self.requested_num_rings
+
+        if self.center_cell_only:
+            self.num_cells = 1
+            self.num_bs = CENTER_CELL_NUM_SECTORS
+        else:
+            self.num_cells = get_num_hex_in_grid(self.topology_num_rings)
+            self.num_bs = self.num_cells * CENTER_CELL_NUM_SECTORS
+
         self.num_ut = self.num_bs * self.num_ut_per_sector
         self.num_ut_ant = ut_array.num_ant
         self.num_bs_ant = bs_array.num_ant
@@ -144,12 +160,46 @@ class SystemLevelSimulator(Block):
                 average_building_height=average_building_height,
                 **common_params)
 
+    def _slice_center_cell_topology(self):
+        """Keep only the 3 sectors and UEs of the center cell.
+
+        gen_hexgrid_topology(num_rings=1) returns the center cell first,
+        followed by the outer-ring cells. Since each cell has 3 sectors, the
+        center-cell BS/sector indices are 0, 1, and 2. The UTs are grouped by
+        sector, so the center-cell UT indices are the first
+        3*num_ut_per_sector entries.
+        """
+        bs_slice = slice(0, CENTER_CELL_NUM_SECTORS)
+        ut_slice = slice(0, CENTER_CELL_NUM_SECTORS * self.num_ut_per_sector)
+
+        self.bs_loc = self.bs_loc[:, bs_slice, :]
+        self.bs_orientations = self.bs_orientations[:, bs_slice, :]
+
+        self.ut_loc = self.ut_loc[:, ut_slice, :]
+        self.ut_orientations = self.ut_orientations[:, ut_slice, :]
+        self.ut_velocities = self.ut_velocities[:, ut_slice, :]
+        self.in_state = self.in_state[:, ut_slice]
+
+        # bs_virtual_loc is normally indexed as [batch, num_bs, num_ut, 3].
+        if torch.is_tensor(self.bs_virtual_loc):
+            self.bs_virtual_loc = self.bs_virtual_loc[:, bs_slice, ut_slice, :]
+
+        # Depending on Sionna version / los argument, self.los can be a bool or
+        # a tensor. Slice only when it is tensor-valued.
+        if torch.is_tensor(self.los):
+            if self.los.ndim >= 3:
+                # Typical shape: [batch, num_bs, num_ut, ...]
+                self.los = self.los[:, bs_slice, ut_slice, ...]
+            elif self.los.ndim == 2:
+                # Fallback for a UT-only shape: [batch, num_ut]
+                self.los = self.los[:, ut_slice]
+
     def _setup_topology(self, num_rings, min_bs_ut_dist, max_bs_ut_dist):
         self.ut_loc, self.bs_loc, self.ut_orientations, self.bs_orientations, \
             self.ut_velocities, self.in_state, self.los, self.bs_virtual_loc, self.grid = \
             gen_hexgrid_topology(
                 batch_size=self.batch_size,
-                num_rings=num_rings,
+                num_rings=self.topology_num_rings,
                 num_ut_per_sector=self.num_ut_per_sector,
                 min_bs_ut_dist=min_bs_ut_dist,
                 max_bs_ut_dist=max_bs_ut_dist,
@@ -157,6 +207,9 @@ class SystemLevelSimulator(Block):
                 los=True,
                 return_grid=True,
                 precision=self.precision)
+
+        if self.center_cell_only:
+            self._slice_center_cell_topology()
 
         self.channel_model.set_topology(
             self.ut_loc, self.bs_loc, self.ut_orientations,
