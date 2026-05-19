@@ -223,6 +223,16 @@ def compute_drop_log_capacity_samples(sls: SystemLevelSimulator,
 
     return np.concatenate(slot_stream_sum_samples), np.concatenate(slot_logdet_samples)
 
+def save_grid_plot_for_first_drop(sls: SystemLevelSimulator, out_path: str = './results/su_mimo_grid.png'):
+    fig = sls.grid.show()
+    ax = fig.get_axes()
+    ut_loc_np = sls.ut_loc.cpu().numpy() if hasattr(sls.ut_loc, 'cpu') else sls.ut_loc
+    ax[0].plot(ut_loc_np[0, :, 0], ut_loc_np[0, :, 1], 'xk', label='user position')
+    ax[0].legend()
+    plt.savefig(out_path, dpi=300)
+    plt.close(fig)
+    print(f'Saved grid plot to: {out_path}')
+
 def main():
     parser = argparse.ArgumentParser(description='SU-MIMO sector sum-throughput CDF experiment')
     parser.add_argument('--num-drops', type=int, default=10)
@@ -266,6 +276,9 @@ def main():
             num_rings=args.num_rings,
             bs_max_power_dbm=bs_max_power_dbm,
             ut_max_power_dbm=ut_max_power_dbm)
+        
+        if drop_idx == 0:
+            save_grid_plot_for_first_drop(sls, './results/su_mimo_grid.png')
 
         stream_sum_samples, logdet_samples = compute_drop_log_capacity_samples(
             sls=sls,
