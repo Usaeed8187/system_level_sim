@@ -157,7 +157,7 @@ def compute_drop_log_capacity_samples(sls: SystemLevelSimulator,
         zf_precoder = RZFPrecodedChannel(resource_grid=rg,
                                          stream_management=sls.stream_management)
     elif precoder == 'slnr':
-        zf_precoder = StreamSLNRPrecodedChannel(resource_grid=rg,
+        zf_precoder = UESLNRPrecodedChannel(resource_grid=rg,
                                                 stream_management=sls.stream_management)
     else:
         raise ValueError(f"Unsupported precoder '{precoder}'. Use 'rzf' or 'slnr'.")
