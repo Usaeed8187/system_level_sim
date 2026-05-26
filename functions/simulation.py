@@ -1,9 +1,19 @@
 
 from .utils import *
+import numpy as np
+import torch
 from sionna.sys import PHYAbstraction, \
-    OuterLoopLinkAdaptation, gen_hexgrid_topology, \
+    OuterLoopLinkAdaptation, \
     get_pathloss, open_loop_uplink_power_control, downlink_fair_power_control, \
-    get_num_hex_in_grid, PFSchedulerSUMIMO
+    PFSchedulerSUMIMO
+
+# Use the repo-local topology helper so the constrained UE dropping logic is
+# version-controlled with this experiment instead of requiring edits to the
+# installed Sionna package.
+try:
+    from .topology import gen_hexgrid_topology, get_num_hex_in_grid
+except ImportError:
+    from topology import gen_hexgrid_topology, get_num_hex_in_grid
     
 from sionna.sys.utils import spread_across_subcarriers
 from sionna.phy.utils import dbm_to_watt
@@ -80,6 +90,10 @@ class SystemLevelSimulator(Block):
                  o2i_model='low',
                  average_street_width=20.0,
                  average_building_height=5.0,
+                 min_ue_azimuth_separation_deg=10.0,
+                 ue_elevation_mode='None',
+                 ue_elevation_angle_deg=None,
+                 fixed_ue_height=1.5,
                  precision=None):
         super().__init__(precision=precision)
 
@@ -93,6 +107,11 @@ class SystemLevelSimulator(Block):
         self.bs_max_power_dbm = bs_max_power_dbm
         self.ut_max_power_dbm = ut_max_power_dbm
         self.coherence_time = int(coherence_time)
+        self.min_ue_azimuth_separation_deg = min_ue_azimuth_separation_deg
+        self.ue_elevation_mode = ue_elevation_mode
+        self.ue_elevation_angle_deg = ue_elevation_angle_deg
+        self.fixed_ue_height = fixed_ue_height
+
 
         # Sionna's built-in HexGrid requires num_rings > 0. We use
         # num_rings == 0 as a custom, efficient "center cell only" mode:
@@ -250,16 +269,84 @@ class SystemLevelSimulator(Block):
                 scenario=self.scenario,
                 los=True,
                 return_grid=True,
+                min_ue_azimuth_separation_deg=self.min_ue_azimuth_separation_deg,
+                ue_elevation_mode=self.ue_elevation_mode,
+                ue_elevation_angle_deg=self.ue_elevation_angle_deg,
+                fixed_ue_height=self.fixed_ue_height,
                 precision=self.precision)
 
         if self.center_cell_only:
             self._slice_center_cell_topology()
             self.grid = CenterCellGrid(self.grid, self.bs_loc, self.ut_loc)
 
+        # Expose the initial post-drop UE angles for each serving sector.
+        # Shapes: [batch_size, num_bs, num_ut_per_sector].
+        self._compute_ue_theta_phi()
+
         self.channel_model.set_topology(
             self.ut_loc, self.bs_loc, self.ut_orientations,
             self.bs_orientations, self.ut_velocities,
             self.in_state, self.los, self.bs_virtual_loc)
+
+    def _compute_ue_theta_phi(self):
+        """Expose the serving-BS UE angles after the topology drop.
+
+        The exposed tensors are:
+
+        * ``self.ue_theta_deg``: 3GPP-style zenith angle, in degrees.
+          A UE exactly at the BS horizon has theta = 90 deg; a ground UE below
+          the BS horizon has theta > 90 deg.
+        * ``self.ue_phi_deg``: azimuth angle, in degrees, relative to the
+          serving sector boresight/yaw. This is the angle you can later use as
+          the 38.922 observation azimuth phi for that UE, and as phi_escan if
+          you steer the beam directly toward the UE.
+
+        Both tensors have shape [batch_size, num_bs, num_ut_per_sector].
+        The UT ordering in ``self.ut_loc`` is sector-major, so reshaping by
+        [batch_size, num_bs, num_ut_per_sector, 3] aligns each UE with its
+        serving sector/BS.
+        """
+        ut_loc_by_sector = torch.reshape(
+            self.ut_loc,
+            [self.batch_size, self.num_bs, self.num_ut_per_sector, 3])
+
+        rel = ut_loc_by_sector - self.bs_loc[:, :, None, :]
+        dx = rel[..., 0]
+        dy = rel[..., 1]
+        dz = rel[..., 2]
+
+        d3d = torch.sqrt(dx**2 + dy**2 + dz**2)
+
+        # 3GPP-style zenith angle theta: angle from +z axis.
+        cos_theta = dz / torch.clamp(d3d, min=1e-30)
+        theta_rad = torch.acos(torch.clamp(cos_theta, -1.0, 1.0))
+
+        # Global azimuth from BS to UE, then convert to sector-local azimuth by
+        # subtracting the BS yaw. Wrap to [-pi, pi].
+        phi_global_rad = torch.atan2(dy, dx)
+        bs_yaw_rad = self.bs_orientations[:, :, 0]
+        phi_rad = phi_global_rad - bs_yaw_rad[:, :, None]
+        phi_rad = torch.atan2(torch.sin(phi_rad), torch.cos(phi_rad))
+
+        self.ue_theta_rad = theta_rad
+        self.ue_phi_rad = phi_rad
+        self.ue_theta_deg = theta_rad * (180.0 / np.pi)
+        self.ue_phi_deg = phi_rad * (180.0 / np.pi)
+
+        # Minimal convenience dictionary. Keep only theta and phi, as requested.
+        self.ue_angles = {
+            'theta_deg': self.ue_theta_deg,
+            'phi_deg': self.ue_phi_deg,
+        }
+        return self.ue_angles
+
+    def refresh_ue_theta_phi(self):
+        """Recompute UE theta/phi from the current UE locations.
+
+        This is useful only if you want angles after mobility updates. The
+        initial angles are already computed immediately after the drop.
+        """
+        return self._compute_ue_theta_phi()
 
     def _reset_olla(self, bler_target, olla_delta_up):
         """Reset OLLA parameters - must be called OUTSIDE compiled code."""

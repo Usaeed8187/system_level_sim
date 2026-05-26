@@ -14,9 +14,9 @@ if str(ROOT) not in sys.path:
 
 os.makedirs('./results', exist_ok=True)
 
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
-if os.getenv('CUDA_VISIBLE_DEVICES') is None:
-    os.environ['CUDA_VISIBLE_DEVICES'] = ''
+# os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+# if os.getenv('CUDA_VISIBLE_DEVICES') is None:
+#     os.environ['CUDA_VISIBLE_DEVICES'] = ''
 
 try:
     import sionna.sys
@@ -29,6 +29,7 @@ except ImportError as e:
     raise e
 
 from sionna.phy.channel.tr38901 import PanelArray
+from functions.antenna_38922 import PanelArray_38922
 from sionna.phy.ofdm import ResourceGrid, RZFPrecodedChannel, LMMSEPostEqualizationSINR
 from functions.slnr_precoder import UESLNRPrecodedChannel
 from sionna.phy.utils import dbm_to_watt
@@ -45,22 +46,11 @@ def build_simulator(num_ut_per_sector: int,
                     scenario: str,
                     direction: str,
                     num_rings: int,
+                    bs_array: PanelArray_38922,
+                    ut_array: PanelArray_38922,
                     bs_max_power_dbm: float,
                     ut_max_power_dbm: float):
-    bs_array = PanelArray(num_rows_per_panel=2,
-                          num_cols_per_panel=4,
-                          polarization='dual',
-                          polarization_type='VH',
-                          antenna_pattern='38.901',
-                          carrier_frequency=carrier_frequency)
-
-    # Two UT antennas are needed to support two spatial streams/user.
-    ut_array = PanelArray(num_rows_per_panel=1,
-                          num_cols_per_panel=2,
-                          polarization='single',
-                          polarization_type='V',
-                          antenna_pattern='omni',
-                          carrier_frequency=carrier_frequency)
+    
 
     resource_grid = ResourceGrid(num_ofdm_symbols=num_ofdm_sym,
                                  fft_size=num_subcarriers,
@@ -162,6 +152,7 @@ def compute_drop_log_capacity_samples(sls: SystemLevelSimulator,
     else:
         raise ValueError(f"Unsupported precoder '{precoder}'. Use 'rzf' or 'slnr'.")
     zf_alpha = torch.zeros(1, dtype=sls.dtype, device=sls.device)
+    zf_alpha = sls.no * num_streams_per_ut
     lmmse_posteq_sinr = LMMSEPostEqualizationSINR(resource_grid=rg,
                                                   stream_management=sls.stream_management)
     
@@ -223,7 +214,7 @@ def compute_drop_log_capacity_samples(sls: SystemLevelSimulator,
 
     return np.concatenate(slot_stream_sum_samples), np.concatenate(slot_logdet_samples)
 
-def save_grid_plot_for_first_drop(sls: SystemLevelSimulator, out_path: str = './results/su_mimo_grid.png'):
+def save_grid_plot_for_first_drop(sls: SystemLevelSimulator, out_path: str = './results/grid.png'):
     fig = sls.grid.show()
     ax = fig.get_axes()
     ut_loc_np = sls.ut_loc.cpu().numpy() if hasattr(sls.ut_loc, 'cpu') else sls.ut_loc
@@ -235,14 +226,24 @@ def save_grid_plot_for_first_drop(sls: SystemLevelSimulator, out_path: str = './
 
 def main():
     parser = argparse.ArgumentParser(description='SU-MIMO sector sum-throughput CDF experiment')
-    parser.add_argument('--num-drops', type=int, default=10)
+    parser.add_argument('--num-drops', type=int, default=100)
     parser.add_argument('--num-slots', type=int, default=10,
                         help='Number of slots simulated per drop (default: 10)')
+    parser.add_argument('--num-ut-per-sector', type=int, default=1)
+    parser.add_argument('--num-streams-per-ut', type=int, default=2)
+    parser.add_argument('--scenario', type=str, default='umi', choices=['umi', 'uma', 'rma'])
+    parser.add_argument('--num-bs-horizontal-antennas', type=int, default=4, help='Number of horizontal antennas per BS panel (default: 4)')
+    parser.add_argument('--num-bs-vertical-antennas', type=int, default=2, help='Number of vertical antennas per BS panel (default: 2)')
+    parser.add_argument('--bs-pattern', type=str, default='38.922', choices=['38.901', '38.922'], help='BS antenna pattern (default: 38.922)')
+    parser.add_argument('--num-ut-horizontal-antennas', type=int, default=2, help='Number of horizontal antennas per UT panel (default: 2)')
+    parser.add_argument('--num-ut-vertical-antennas', type=int, default=1, help='Number of vertical antennas per UT panel (default: 1)')
     parser.add_argument('--num-rings', type=int, default=0)
     parser.add_argument('--num-ofdm-sym', type=int, default=1)
     parser.add_argument('--num-subcarriers', type=int, default=128)
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--out', type=str, default='./results/su_mimo_log1p_sinr_cdf.png')
+    parser.add_argument('--rawoutput', type=str, default=None,
+                        help='Path to save raw samples as .npz (default: save to ./results/raw/some_name.npz where some_name is derived from the simulation parameters)')
     parser.add_argument('--target-sector-index', type=int, default=0,
                         help='Deterministic global sector index (default: 0)')
     parser.add_argument('--precoder', type=str, default='rzf', choices=['rzf', 'slnr'],
@@ -250,9 +251,9 @@ def main():
     args = parser.parse_args()
 
     # SU-MIMO setup requested by user
-    num_ut_per_sector = 1
-    num_streams_per_ut = 2
-    scenario = 'umi'
+    num_ut_per_sector = args.num_ut_per_sector
+    num_streams_per_ut = args.num_streams_per_ut
+    scenario = args.scenario
     direction = 'downlink'
     carrier_frequency = 3.5e9
     bs_max_power_dbm = 56.0
@@ -260,7 +261,20 @@ def main():
 
     all_stream_sum_samples = []
     all_logdet_samples = []
+    bs_array = PanelArray_38922(num_rows_per_panel=args.num_bs_vertical_antennas,
+                          num_cols_per_panel=args.num_bs_horizontal_antennas,
+                          polarization='dual',
+                          polarization_type='VH',
+                          antenna_pattern=args.bs_pattern,
+                          carrier_frequency=carrier_frequency)
 
+    # Two UT antennas are needed to support two spatial streams/user.
+    ut_array = PanelArray_38922(num_rows_per_panel=args.num_ut_vertical_antennas,
+                          num_cols_per_panel=args.num_ut_horizontal_antennas,
+                          polarization='single',
+                          polarization_type='V',
+                          antenna_pattern='omni',
+                          carrier_frequency=carrier_frequency)
     for drop_idx in range(args.num_drops):
         sionna.phy.config.seed = args.seed + drop_idx
         sionna.phy.config.precision = 'single'
@@ -275,7 +289,9 @@ def main():
             direction=direction,
             num_rings=args.num_rings,
             bs_max_power_dbm=bs_max_power_dbm,
-            ut_max_power_dbm=ut_max_power_dbm)
+            ut_max_power_dbm=ut_max_power_dbm,
+            bs_array=bs_array,
+            ut_array=ut_array)
         
         if drop_idx == 0:
             save_grid_plot_for_first_drop(sls, './results/su_mimo_grid.png')
@@ -310,6 +326,19 @@ def main():
     plt.savefig(args.out, dpi=300)
     print(f'Saved CDF plot to: {args.out}')
 
+    # Save raw samples
+    if args.rawoutput is None:
+        # Create a filename that encodes the simulation parameters for traceability.
+        folder = './results/raw'
+        folder += '/su_mimo'
+        folder += f'/{direction}'
+        folder += f'/{scenario}'
+        folder += f'/rings{args.num_rings}'
+        os.makedirs(folder, exist_ok=True)
+        args.rawoutput = folder + '/' +  f'ut{num_ut_per_sector}_streams{num_streams_per_ut}_bspattern_{args.bs_pattern}_bsant{args.num_bs_vertical_antennas}x{args.num_bs_horizontal_antennas}_utant{args.num_ut_vertical_antennas}x{args.num_ut_horizontal_antennas}_precoder_{args.precoder}_ofdm{args.num_ofdm_sym}_subc{args.num_subcarriers}_seed{args.seed}.npz'
+         
+    np.savez(args.rawoutput, stream_sum_samples=all_stream_sum_samples, logdet_samples=all_logdet_samples)
+    print(f'Saved raw samples to: {args.rawoutput}')
 
 if __name__ == '__main__':
     main()
